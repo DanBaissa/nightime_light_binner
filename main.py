@@ -1,100 +1,129 @@
-import os
-import matplotlib.pyplot as plt
 import numpy as np
-import rasterio
-from rasterio import features
-from rasterio.mask import mask
-from shapely.geometry import shape, Polygon
+import matplotlib.pyplot as plt
 import geopandas as gpd
-from rasterio.plot import show
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
+import rasterstats
 import tkinter as tk
 from tkinter import filedialog
+from shapely.geometry import Polygon
 
 class App:
     def __init__(self, master):
         self.master = master
-        master.title("Raster Processing")
+        master.title("Shapefile Processing")
 
-        self.label = tk.Label(master, text="Raster Processing App")
+        self.label = tk.Label(master, text="Shapefile Processing App")
         self.label.pack()
 
-        self.input_dir_button = tk.Button(master, text="Select Raster Directory", command=self.select_input_dir)
-        self.input_dir_button.pack()
+        self.shapefile_button = tk.Button(master, text="Select Shapefile", command=self.select_shapefile)
+        self.shapefile_button.pack()
 
-        self.output_dir_button = tk.Button(master, text="Select Shapefile Output Directory", command=self.select_output_dir)
+        self.raster_button = tk.Button(master, text="Select Raster", command=self.select_raster)
+        self.raster_button.pack()
+
+        self.output_dir_button = tk.Button(master, text="Select Output Directory", command=self.select_output_dir)
         self.output_dir_button.pack()
 
         self.run_button = tk.Button(master, text="Run", command=self.run)
         self.run_button.pack()
 
-        self.input_dir = None
+        self.shapefile_path = None
+        self.raster_path = None
         self.output_dir = None
 
-    def select_input_dir(self):
-        self.input_dir = filedialog.askdirectory(title="Select directory containing raster files (.tif)")
-        print(f"Selected input directory: {self.input_dir}")
+    def select_shapefile(self):
+        self.shapefile_path = filedialog.askopenfilename(title="Select Shapefile", filetypes=[("Shapefile", "*.shp")])
+        print(f"Selected Shapefile: {self.shapefile_path}")
+
+    def select_raster(self):
+        self.raster_path = filedialog.askopenfilename(title="Select Raster", filetypes=[("Raster", "*.tif")])
+        print(f"Selected Raster: {self.raster_path}")
 
     def select_output_dir(self):
-        self.output_dir = filedialog.askdirectory(title="Select output directory for shapefile")
+        self.output_dir = filedialog.askdirectory(title="Select output directory")
         print(f"Selected output directory: {self.output_dir}")
 
     def run(self):
-        if self.input_dir is None or self.output_dir is None:
-            print("Please select both the input and output directories before running.")
+        if self.shapefile_path is None or self.output_dir is None or self.raster_path is None:
+            print("Please select the shapefile, raster and output directory before running.")
             return
 
-        # get list of raster files
-        raster_files = [os.path.join(self.input_dir, f) for f in os.listdir(self.input_dir) if f.endswith('.tif')]
+        # load shapefile
+        gdf = gpd.read_file(self.shapefile_path)
 
-        # read raster file
-        r = rasterio.open(raster_files[0])  # assuming there's at least one .tif file
+        # set CRS if not already set
+        if gdf.crs is None:
+            gdf.set_crs("EPSG:4326", inplace=True)
 
-        # Creating Binning Function
-        ppside = 100
-        h = np.ceil(r.width / ppside)
-        v = np.ceil(r.height / ppside)
+        # convert to Web Mercator projection (units in meters)
+        gdf = gdf.to_crs(epsg=3857)
 
-        # create a transformation matrix for the aggregated raster
-        transform = rasterio.transform.from_origin(
-            r.bounds.left, r.bounds.top, r.transform[0] * h, r.transform[4] * v)
+        # create grid
+        xmin, ymin, xmax, ymax = gdf.total_bounds
+        width = height = 10_000  # 10km grid size
 
-        # aggregate raster
-        agg = r.read(1, out_shape=(int(v), int(h)))
+        rows = int(np.ceil((ymax-ymin) / height))
+        cols = int(np.ceil((xmax-xmin) / width))
 
-        # convert aggregated raster to polygons
-        agg_poly = features.shapes(agg.astype(np.int16), transform=transform)
-        agg_poly = [shape(geom) for geom, val in agg_poly if val != 0]
+        polygons = []
+        for x in range(cols):
+            for y in range(rows):
+                polygons.append(Polygon([(x*width+xmin, y*height+ymin),
+                                         ((x+1)*width+xmin, y*height+ymin),
+                                         ((x+1)*width+xmin, (y+1)*height+ymin),
+                                         (x*width+xmin, (y+1)*height+ymin)]))
 
-        # create a GeoDataFrame from the polygons
-        gdf = gpd.GeoDataFrame({'geometry': agg_poly})
+        grid = gpd.GeoDataFrame({'geometry': polygons}, crs='EPSG:3857')
 
-        # calculate mean raster value for each polygon
-        r_mean = []
-        for geom in agg_poly:
-            out_image, _ = mask(r, [geom], crop=True)
-            r_mean.append(np.nanmean(out_image))
+        # perform intersection between shapefile and grid
+        intersection = gpd.overlay(gdf, grid, how='intersection')
 
-        # add the mean values to the GeoDataFrame
-        gdf['BM_month_1'] = r_mean
-
-        # Plotting the original raster with the grid overlay
+        # plot intersection
         fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-
-        show(r, ax=ax)
-        gdf.boundary.plot(ax=ax, color='red')
-
+        intersection.plot(ax=ax, edgecolor='black', facecolor='white')
         plt.show()
+        plt.close(fig)  # explicitly close the figure
 
-        # Plotting the binned night lights data
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        # save intersection to new shapefile
+        intersection.to_file(f"{self.output_dir}/intersection.shp")
 
-        gdf.plot(column='BM_month_1', ax=ax, legend=True)
+        # load raster and reproject to match intersection
+        with rasterio.open(self.raster_path) as src:
+            transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
+            kwargs = src.meta.copy()
+            kwargs.update({
+                'crs': intersection.crs.to_string(),
+                'transform': transform,
+                'width': width,
+                'height': height
+            })
 
+            with MemoryFile() as memfile:
+                with memfile.open(**kwargs) as dest:
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=rasterio.band(dest, 1),
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=intersection.crs.to_string(),
+                        resampling=Resampling.nearest
+                    )
+                reprojected_raster = memfile.open().read(1)
+
+        # calculate zonal statistics
+        zonal_stats = rasterstats.zonal_stats(intersection, reprojected_raster, affine=kwargs['transform'], stats=['mean'])
+
+        # add zonal stats to intersection GeoDataFrame and plot
+        intersection['mean'] = [stat['mean'] for stat in zonal_stats]
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))  # create a new figure and axes
+        intersection.plot(column='mean', legend=True, ax=ax)
         plt.show()
-
-        # write GeoDataFrame to shapefile
-        output_filepath = os.path.join(self.output_dir, "Eth_Merged.shp")
-        gdf.to_file(output_filepath)
+        plt.close(fig)  # explicitly close the figure
 
 root = tk.Tk()
 app = App(root)

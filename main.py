@@ -85,12 +85,6 @@ class App:
         # perform intersection between shapefile and grid
         intersection = gpd.overlay(gdf, grid, how='intersection')
 
-        # plot intersection
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-        intersection.plot(ax=ax, edgecolor='black', facecolor='white')
-        plt.show()
-        plt.close(fig)  # explicitly close the figure
-
         # load raster and reproject to match intersection
         with rasterio.open(self.raster_path) as src:
             transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
@@ -150,10 +144,19 @@ class App:
         # save intersection to new shapefile
         intersection.to_file(f"{self.output_dir}/intersection.shp")
 
-        # plot intersection with logged zonal stats data
+        # plot intersection with logged zonal stats data for the raster
         fig, ax = plt.subplots(1, 1, figsize=(10, 10))
         intersection.plot(column=np.log1p(intersection[raster_column_name]), ax=ax, legend=True, edgecolor='black')
+        plt.title(f'Logged {raster_column_name}')
         plt.show()
+
+        # plot intersection with logged zonal stats data for each population count column
+        for column in ['All_Population_Count_2000', 'All_Population_Count_2005', 'All_Population_Count_2010',
+                       'All_Population_Count_2015', 'All_Population_Count_2020']:
+            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+            intersection.plot(column=np.log1p(intersection[f'mean_{column}']), ax=ax, legend=True, edgecolor='black')
+            plt.title(f'Logged mean {column}')
+            plt.show()
 
 root = tk.Tk()
 app = App(root)

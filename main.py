@@ -19,14 +19,14 @@ class App:
         master.title("Raster Merger")
 
         self.shapefile_path = None
-        self.raster_path = None
+        self.raster_paths = None
         self.csv_path = None
         self.output_dir = None
 
         self.select_shapefile_button = tk.Button(master, text="Select Shapefile", command=self.select_shapefile)
         self.select_shapefile_button.pack()
 
-        self.select_raster_button = tk.Button(master, text="Select Raster", command=self.select_raster)
+        self.select_raster_button = tk.Button(master, text="Select Rasters", command=self.select_raster)
         self.select_raster_button.pack()
 
         self.select_csv_button = tk.Button(master, text="Select CSV", command=self.select_csv)
@@ -42,7 +42,7 @@ class App:
         self.shapefile_path = filedialog.askopenfilename(filetypes=(("Shapefile", "*.shp"), ("All files", "*.*")))
 
     def select_raster(self):
-        self.raster_path = filedialog.askopenfilename(filetypes=(("GeoTIFF", "*.tif"), ("All files", "*.*")))
+        self.raster_paths = filedialog.askopenfilenames(filetypes=(("GeoTIFF", "*.tif"), ("All files", "*.*")))
 
     def select_csv(self):
         self.csv_path = filedialog.askopenfilename(filetypes=(("CSV Files", "*.csv"), ("All files", "*.*")))
@@ -51,8 +51,8 @@ class App:
         self.output_dir = filedialog.askdirectory()
 
     def run(self):
-        if self.shapefile_path is None or self.output_dir is None or self.raster_path is None or self.csv_path is None:
-            print("Please select the shapefile, raster, CSV and output directory before running.")
+        if self.shapefile_path is None or self.output_dir is None or self.raster_paths is None or self.csv_path is None:
+            print("Please select the shapefile, rasters, CSV and output directory before running.")
             return
 
         # load shapefile
@@ -85,77 +85,67 @@ class App:
         # perform intersection between shapefile and grid
         intersection = gpd.overlay(gdf, grid, how='intersection')
 
-        # load raster and reproject to match intersection
-        with rasterio.open(self.raster_path) as src:
-            transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
-            kwargs = src.meta.copy()
-            kwargs.update({
-                'crs': intersection.crs.to_string(),
-                'transform': transform,
-                'width': width,
-                'height': height
-            })
+        # load rasters and reproject to match intersection
+        for raster_path in self.raster_paths:
+            with rasterio.open(raster_path) as src:
+                transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
+                kwargs = src.meta.copy()
+                kwargs.update({
+                    'crs': intersection.crs.to_string(),
+                    'transform': transform,
+                    'width': width,
+                    'height': height
+                })
 
-            with MemoryFile() as memfile:
-                with memfile.open(**kwargs) as dest:
-                    reproject(
-                        source=rasterio.band(src, 1),
-                        destination=rasterio.band(dest, 1),
-                        src_transform=src.transform,
-                        src_crs=src.crs,
-                        dst_transform=transform,
-                        dst_crs=intersection.crs.to_string(),
-                        resampling=Resampling.nearest
-                    )
-                reprojected_raster = memfile.open().read(1)
+                with MemoryFile() as memfile:
+                    with memfile.open(**kwargs) as dest:
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=rasterio.band(dest, 1),
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=transform,
+                            dst_crs=intersection.crs.to_string(),
+                            resampling=Resampling.nearest
+                        )
+                    reprojected_raster = memfile.open().read(1)
 
-        # calculate zonal statistics
-        zonal_stats = rasterstats.zonal_stats(intersection, reprojected_raster, affine=kwargs['transform'], stats=['mean'])
+                # calculate zonal statistics
+                zonal_stats = rasterstats.zonal_stats(intersection, reprojected_raster, affine=kwargs['transform'], stats=['mean'])
 
-        # add zonal stats to intersection GeoDataFrame
-        raster_column_name = os.path.splitext(os.path.basename(self.raster_path))[0]
-        intersection[raster_column_name] = [stat['mean'] for stat in zonal_stats]
+                # add zonal stats to intersection GeoDataFrame
+                raster_column_name = os.path.splitext(os.path.basename(raster_path))[0]
+                intersection[raster_column_name] = [stat['mean'] for stat in zonal_stats]
 
-        # find maximum raster value
-        max_raster_value = np.nanmax(reprojected_raster)
+                # find maximum raster value
+                max_raster_value = np.nanmax(reprojected_raster)
 
-        # replace mean values greater than maximum raster value with NaN
-        intersection.loc[intersection[raster_column_name] > max_raster_value, raster_column_name] = np.nan
+                # replace mean values greater than maximum raster value with NaN
+                intersection.loc[intersection[raster_column_name] > max_raster_value, raster_column_name] = np.nan
 
         # load csv as GeoDataFrame
         df = pd.read_csv(self.csv_path)
-        gdf_points = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.LONGNUM, df.LATNUM), crs='EPSG:4326')
-        gdf_points = gdf_points.to_crs(intersection.crs)
+        gdf_points = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.LONGNUM, df.LATNUM))
+        gdf_points.set_crs("EPSG:4326", inplace=True)  # set CRS
+        gdf_points = gdf_points.to_crs(epsg=3857)  # convert to Web Mercator projection
 
-        # spatial join between grid and points
-        joined = sjoin(gdf_points, intersection, how='inner', op='within')
+        # spatial join points with intersection
+        joined = sjoin(gdf_points, intersection, how='inner')
 
-        # check if the spatial join operation was successful
-        if 'index_right' not in joined.columns:
-            print("No points were found within the polygons.")
-            return
+        # calculate mean of observations for each grid square
+        for column in df.columns:
+            if column not in ['LATNUM', 'LONGNUM']:
+                mean_obs = joined.groupby('index_right')[column].mean()
+                intersection[column] = mean_obs
 
-        # calculate mean of observations for each grid square for each column
-        for column in ['All_Population_Count_2000', 'All_Population_Count_2005', 'All_Population_Count_2010',
-                       'All_Population_Count_2015', 'All_Population_Count_2020']:
-            mean_obs = joined.groupby('index_right')[column].mean()
-            intersection[f'mean_{column}'] = mean_obs
+        # save intersection shapefile
+        intersection.to_file(os.path.join(self.output_dir, 'intersection.shp'))
 
-        # save intersection to new shapefile
-        intersection.to_file(f"{self.output_dir}/intersection.shp")
-
-        # plot intersection with logged zonal stats data for the raster
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-        intersection.plot(column=np.log1p(intersection[raster_column_name]), ax=ax, legend=True, edgecolor='black')
-        plt.title(f'Logged {raster_column_name}')
-        plt.show()
-
-        # plot intersection with logged zonal stats data for each population count column
-        for column in ['All_Population_Count_2000', 'All_Population_Count_2005', 'All_Population_Count_2010',
-                       'All_Population_Count_2015', 'All_Population_Count_2020']:
+        # plot intersection with logged zonal stats data
+        for column in [os.path.splitext(os.path.basename(raster_path))[0] for raster_path in self.raster_paths] + [col for col in df.columns if col not in ['LATNUM', 'LONGNUM']]:
             fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-            intersection.plot(column=np.log1p(intersection[f'mean_{column}']), ax=ax, legend=True, edgecolor='black')
-            plt.title(f'Logged mean {column}')
+            intersection.plot(column=np.log1p(intersection[column]), ax=ax, legend=True, edgecolor='black')
+            plt.title(f'Logged {column}')
             plt.show()
 
 root = tk.Tk()

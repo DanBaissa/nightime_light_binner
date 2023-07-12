@@ -3,52 +3,56 @@ import matplotlib.pyplot as plt
 import geopandas as gpd
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
 import rasterstats
 import tkinter as tk
 from tkinter import filedialog
 from shapely.geometry import Polygon
+import os
+import pandas as pd
+from shapely.geometry import Point
+from geopandas.tools import sjoin
 
 class App:
     def __init__(self, master):
         self.master = master
-        master.title("Shapefile Processing")
+        master.title("Raster Merger")
 
-        self.label = tk.Label(master, text="Shapefile Processing App")
-        self.label.pack()
+        self.shapefile_path = None
+        self.raster_path = None
+        self.csv_path = None
+        self.output_dir = None
 
-        self.shapefile_button = tk.Button(master, text="Select Shapefile", command=self.select_shapefile)
-        self.shapefile_button.pack()
+        self.select_shapefile_button = tk.Button(master, text="Select Shapefile", command=self.select_shapefile)
+        self.select_shapefile_button.pack()
 
-        self.raster_button = tk.Button(master, text="Select Raster", command=self.select_raster)
-        self.raster_button.pack()
+        self.select_raster_button = tk.Button(master, text="Select Raster", command=self.select_raster)
+        self.select_raster_button.pack()
 
-        self.output_dir_button = tk.Button(master, text="Select Output Directory", command=self.select_output_dir)
-        self.output_dir_button.pack()
+        self.select_csv_button = tk.Button(master, text="Select CSV", command=self.select_csv)
+        self.select_csv_button.pack()
+
+        self.select_output_dir_button = tk.Button(master, text="Select Output Directory", command=self.select_output_dir)
+        self.select_output_dir_button.pack()
 
         self.run_button = tk.Button(master, text="Run", command=self.run)
         self.run_button.pack()
 
-        self.shapefile_path = None
-        self.raster_path = None
-        self.output_dir = None
-
     def select_shapefile(self):
-        self.shapefile_path = filedialog.askopenfilename(title="Select Shapefile", filetypes=[("Shapefile", "*.shp")])
-        print(f"Selected Shapefile: {self.shapefile_path}")
+        self.shapefile_path = filedialog.askopenfilename(filetypes=(("Shapefile", "*.shp"), ("All files", "*.*")))
 
     def select_raster(self):
-        self.raster_path = filedialog.askopenfilename(title="Select Raster", filetypes=[("Raster", "*.tif")])
-        print(f"Selected Raster: {self.raster_path}")
+        self.raster_path = filedialog.askopenfilename(filetypes=(("GeoTIFF", "*.tif"), ("All files", "*.*")))
+
+    def select_csv(self):
+        self.csv_path = filedialog.askopenfilename(filetypes=(("CSV Files", "*.csv"), ("All files", "*.*")))
 
     def select_output_dir(self):
-        self.output_dir = filedialog.askdirectory(title="Select output directory")
-        print(f"Selected output directory: {self.output_dir}")
+        self.output_dir = filedialog.askdirectory()
 
     def run(self):
-        if self.shapefile_path is None or self.output_dir is None or self.raster_path is None:
-            print("Please select the shapefile, raster and output directory before running.")
+        if self.shapefile_path is None or self.output_dir is None or self.raster_path is None or self.csv_path is None:
+            print("Please select the shapefile, raster, CSV and output directory before running.")
             return
 
         # load shapefile
@@ -87,9 +91,6 @@ class App:
         plt.show()
         plt.close(fig)  # explicitly close the figure
 
-        # save intersection to new shapefile
-        intersection.to_file(f"{self.output_dir}/intersection.shp")
-
         # load raster and reproject to match intersection
         with rasterio.open(self.raster_path) as src:
             transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
@@ -117,13 +118,42 @@ class App:
         # calculate zonal statistics
         zonal_stats = rasterstats.zonal_stats(intersection, reprojected_raster, affine=kwargs['transform'], stats=['mean'])
 
-        # add zonal stats to intersection GeoDataFrame and plot
-        intersection['mean'] = [stat['mean'] for stat in zonal_stats]
+        # add zonal stats to intersection GeoDataFrame
+        raster_column_name = os.path.splitext(os.path.basename(self.raster_path))[0]
+        intersection[raster_column_name] = [stat['mean'] for stat in zonal_stats]
 
-        fig, ax = plt.subplots(1, 1, figsize=(10, 10))  # create a new figure and axes
-        intersection.plot(column='mean', legend=True, ax=ax)
+        # find maximum raster value
+        max_raster_value = np.nanmax(reprojected_raster)
+
+        # replace mean values greater than maximum raster value with NaN
+        intersection.loc[intersection[raster_column_name] > max_raster_value, raster_column_name] = np.nan
+
+        # load csv as GeoDataFrame
+        df = pd.read_csv(self.csv_path)
+        gdf_points = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.LONGNUM, df.LATNUM), crs='EPSG:4326')
+        gdf_points = gdf_points.to_crs(intersection.crs)
+
+        # spatial join between grid and points
+        joined = sjoin(gdf_points, intersection, how='inner', op='within')
+
+        # check if the spatial join operation was successful
+        if 'index_right' not in joined.columns:
+            print("No points were found within the polygons.")
+            return
+
+        # calculate mean of observations for each grid square for each column
+        for column in ['All_Population_Count_2000', 'All_Population_Count_2005', 'All_Population_Count_2010',
+                       'All_Population_Count_2015', 'All_Population_Count_2020']:
+            mean_obs = joined.groupby('index_right')[column].mean()
+            intersection[f'mean_{column}'] = mean_obs
+
+        # save intersection to new shapefile
+        intersection.to_file(f"{self.output_dir}/intersection.shp")
+
+        # plot intersection with logged zonal stats data
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        intersection.plot(column=np.log1p(intersection[raster_column_name]), ax=ax, legend=True, edgecolor='black')
         plt.show()
-        plt.close(fig)  # explicitly close the figure
 
 root = tk.Tk()
 app = App(root)

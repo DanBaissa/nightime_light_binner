@@ -88,6 +88,11 @@ class App:
         # load rasters and reproject to match intersection
         for raster_path in self.raster_paths:
             with rasterio.open(raster_path) as src:
+                nodata_value = -32768
+                raster_data = src.read(1)
+                raster_data = np.where(raster_data == nodata_value, np.nan, raster_data)  # replace nodata with NaN
+                print(f"Original raster stats for {raster_path}: min={np.nanmin(raster_data)}, max={np.nanmax(raster_data)}")  # Check original raster stats
+
                 transform, width, height = calculate_default_transform(src.crs, intersection.crs.to_string(), src.width, src.height, *src.bounds)
                 kwargs = src.meta.copy()
                 kwargs.update({
@@ -109,6 +114,13 @@ class App:
                             resampling=Resampling.nearest
                         )
                     reprojected_raster = memfile.open().read(1)
+                    reprojected_raster = np.where(reprojected_raster == nodata_value, np.nan, reprojected_raster)  # replace nodata with NaN
+
+                    # save the reprojected raster for inspection
+                    with rasterio.open(f"{os.path.splitext(os.path.basename(raster_path))[0]}_reprojected.tif", 'w', **kwargs) as dest:
+                        dest.write(reprojected_raster, 1)
+
+                print(f"Reprojected raster stats for {raster_path}: min={np.nanmin(reprojected_raster)}, max={np.nanmax(reprojected_raster)}")  # Check reprojected raster stats
 
                 # calculate zonal statistics
                 zonal_stats = rasterstats.zonal_stats(intersection, reprojected_raster, affine=kwargs['transform'], stats=['mean'])

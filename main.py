@@ -153,9 +153,19 @@ class App:
         # save intersection shapefile
         intersection.to_file(os.path.join(self.output_dir, 'intersection.shp'))
 
-        # plot intersection with logged zonal stats data
+
+        # plot intersection with unlogged and logged zonal stats data
         for column in [os.path.splitext(os.path.basename(raster_path))[0] for raster_path in self.raster_paths] + [col for col in df.columns if col not in ['LATNUM', 'LONGNUM']]:
+            # Plot for unlogged data
             fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+            intersection.plot(column=column, ax=ax, legend=True, edgecolor='black')
+            plt.title(f'Unlogged {column}')
+            plt.show()
+
+            # Plot for logged data
+            fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+            # Ensure no negative or NaN values before logging
+            intersection[column] = intersection[column].apply(lambda x: np.nan if x <= 0 else x)
             intersection.plot(column=np.log1p(intersection[column]), ax=ax, legend=True, edgecolor='black')
             plt.title(f'Logged {column}')
             plt.show()
